@@ -1,0 +1,1336 @@
+//@version=6
+strategy("denetleyiciligsmontamponbolgeli", overlay=true)
+
+// Çift sinyal önleme için bayrak
+var bool signalSentThisBar = false
+var bool exitTriggeredThisBar = false
+// GSM bildirimi için tehlike bayrakları
+var bool dangerShortAlertSent = false  // Short için alert kontrolü
+var bool dangerLongAlertSent = false   // Long için alert kontrolü
+
+///******son test*******
+// Kodun başında, mevcut "var" tanımlarıyla birlikte:
+var float lockedLongTpLevel = na
+var float lockedShortTpLevel = na
+var float globalLongBufferLevel = na  // Yeni
+var float globalShortBufferLevel = na  // Yeni
+///******son test*******
+
+var float globalLongTpLevel = na
+
+var float globalShortTpLevel = na
+
+
+
+
+// Her yeni mumda bayrak sıfırlama
+if barstate.isnew
+    signalSentThisBar := false
+    exitTriggeredThisBar := false
+
+// TIME SETTINGS
+import jason5480/time_filters/9 as tif
+group_filter = "============FILTERS============"
+sourceTimezone = input.string(defval='Exchange', title='Timezones Src->Dst', options=['Exchange', 'Europe/London', 'Europe/Berlin', 'Europe/Madrid', 'Europe/Paris', 'Europe/Warsaw', 'Europe/Athens', 'Europe/Moscow'], inline='Timezone', group=group_filter)
+destinationTimezone = input.string(defval='Exchange', title='->', options=['Exchange', 'UTC', 'Europe/London', 'Europe/Berlin', 'Europe/Madrid', 'Europe/Paris', 'Europe/Warsaw', 'Europe/Athens', 'Europe/Moscow'], inline='Timezone', group=group_filter)
+hoursOffsetInput = input.float(3.0, "Timezone offset (in hours)", minval=-12.0, maxval=14.0, step=0.5)
+var dateTimeWindow = tif.DateTimeWindow.new(
+  fromDateTime = input.bool(defval = true, title = 'From', inline = 'From Date', group = group_filter) ? input.time(defval = timestamp('02 Jan 2025 07:00'), title = '', inline = 'From Date', group = group_filter) : na,
+  toDateTime = input.bool(defval = false, title = 'To?', inline = 'To Date', group = group_filter) ? input.time(defval = timestamp('01 Jan 2026 00:00'), title = '', inline = 'To Date', group = group_filter) : na)
+bool dateFilterApproval = dateTimeWindow.is_in_range(srcTimezone=sourceTimezone, dstTimezone=destinationTimezone)
+
+// INPUTS
+int length = input.int(4, title="ZLMA Length")
+int smaLength = input.int(22, title="SMA Length", minval=1)
+bool show_levl = input.bool(true, "Trend Levels")
+float volumeThreshold = input.float(65.0, title="Volume Threshold (%)", minval=0.1, maxval=200.0)
+int lookback = input.int(1, title="Volume Lookback Period", minval=1)
+bool enableFakeStopLoss = input.bool(true, "Sahte Stop-Loss’u Etkinleştir", group="Stop Loss Ayarları")
+float fakeSlOffsetPct = input.float(123.0, "Sahte SL Kaydırma Yüzdesi (%)", minval=1, maxval=200.0, step=1, group="Stop Loss Ayarları", tooltip="Gerçek SL ile sahte SL arasındaki mesafeyi yüzde olarak ayarlar. 100% = Gerçek SL ile aynı, 50% = Gerçek SL’nin yarısı kadar kaydırma.")
+bool disableStopLoss = input.bool(false, title="Stop-Loss’u Devre Dışı Bırak (Acil Durum)", group="Stop Loss Ayarları")
+bool disableLongTrades = input.bool(false, title="Long İşlemleri Devre Dışı Bırak", group="İşlem Kontrolü")
+bool disableShortTrades = input.bool(false, title="Short İşlemleri Devre Dışı Bırak", group="İşlem Kontrolü")
+bool closeLongTrades = input.bool(false, title="Long İşlemleri Kapat", group="İşlem Kontrolü")
+bool closeShortTrades = input.bool(false, title="Short İşlemleri Kapat", group="İşlem Kontrolü")
+int confirmationBars = input.int(1, title="Sinyal Onayı için Mum Sayısı", minval=1)
+bool enableSlFilter = input.bool(true, "SL Sonrası Giriş Filtresi", group="İşlem Kontrolü")
+int slLookbackPeriod = input.int(3, "SL Sonrası Fiyat İzleme Mum Sayısı", minval=1, maxval=20, group="İşlem Kontrolü")
+
+bool enableBufferZone = input.bool(true, "TP Tampon Bölgeyi Etkinleştir", group="İşlem Kontrolü", tooltip="Tampon bölgeye giren fiyat geri dönerse pozisyonu kapatır, iğne teması TP’yi tetikler.")
+float bufferZonePctLong = input.float(0.6, "Long TP Tampon Bölge Yüzdesi (%)", minval=0.1, maxval=10.0, step=0.1, group="İşlem Kontrolü", tooltip="Long TP seviyesine yakın tampon bölge mesafesi.")
+float bufferZonePctShort = input.float(0.6, "Short TP Tampon Bölge Yüzdesi (%)", minval=0.1, maxval=10.0, step=0.1, group="İşlem Kontrolü", tooltip="Short TP seviyesine yakın tampon bölge mesafesi.")
+// "Yeni Sinyal Ayarları" veya "İşlem Kontrolü" grubuna ekle
+float preBufferZonePctLong = input.float(0.3, "Long Ön Tampon Bölge Yüzdesi (%)", minval=0.1, maxval=5.0, step=0.1, group="İşlem Kontrolü", tooltip="Long TP seviyesine yakın ön tampon bölge mesafesi (tampon bölge öncesi).")
+float preBufferZonePctShort = input.float(0.3, "Short Ön Tampon Bölge Yüzdesi (%)", minval=0.1, maxval=5.0, step=0.1, group="İşlem Kontrolü", tooltip="Short TP seviyesine yakın ön tampon bölge mesafesi (tampon bölge öncesi).")
+
+
+float longTakeProfitPct = input.float(1.2, title="Long Take Profit (%)", minval=0.1, maxval=50.0, step=0.1)
+bool iz_suren_long_stoploss = input.bool(true, "Long- İz Süren Stoploss Aktif")
+float shortTakeProfitPct = input.float(1.1, title="Short Take Profit (%)", minval=0.1, maxval=50.0, step=0.1)
+bool iz_suren_short_stoploss = input.bool(true, "Short- İz Süren Stoploss Aktif")
+int atrLength = input.int(6, title="ATR Periyodu", minval=1)
+float atrMultiplierLong = input.float(3.5, title="Long ATR Çarpanı", minval=0.1, step=0.1)
+float atrMultiplierShort = input.float(4.9, title="Short ATR Çarpanı", minval=0.1, step=0.1)
+int rsiLength = input.int(10, title="RSI Length", minval=1)
+float rsiOverbought = input.float(69, title="RSI Overbought Level", minval=1, maxval=90)
+float rsiOversold = input.float(34, title="RSI Oversold Level", minval=2, maxval=85)
+float slopeThresholdInput = input.float(1.0, "SMA Eğim Eşiği (%)", minval=0.1, maxval=5.0, group="Stop Loss Ayarları")
+bool useRsiForSL = input.bool(true, "SL için RSI Kullan", group="Stop Loss Ayarları")
+
+//***************Özel Ani Pump******************
+bool enableCustomThreshold = input.bool(true, "Özel Ani Hareketi Etkinleştir", group="Yeni Sinyal Ayarları", tooltip="SMA-ZLMA ilişkisine bakmadan ani hareketlerde sinyal üretir.")
+//***************Özel Ani Pump******************
+//*************gsm bildirimi için *********************************
+// Global Tanımlar (Kodun başında olmalı)
+var bool manualWaiting = false  // Mevcut manualWaiting tanımı
+//*************gsm bildirimi için *********************************
+enableSupervisor = input.bool(true, "Denetleyiciyi Etkinleştir")
+supervisorLog = input.bool(true, "Denetleyici Loglarını Göster")
+
+
+// TP Zaman Sınırı ve Temas Input’ları
+bool enableTpTouch = input.bool(false, "TP’ye Temas Kapanışını Etkinleştir", group="Yeni Sinyal Ayarları", tooltip="Fiyat TP’ye dokunduğunda (iğne dahil) pozisyonu kapatır.")
+
+// YENİ SİNYAL MANTIĞI - INPUTS
+int weakCandleLookback = input.int(7, title="Zayıflama Mum Sayısı", minval=1, group="Yeni Sinyal Ayarları")
+float longVolumeDecreaseThreshold = input.float(0.5, title="Long Hacim Azalma Oranı (%)", minval=0.1, maxval=50.0, step=0.1, group="Yeni Sinyal Ayarları")
+float shortVolumeDecreaseThreshold = input.float(0.6, title="Short Hacim Azalma Oranı (%)", minval=0.1, maxval=50.0, step=0.1, group="Yeni Sinyal Ayarları")
+float trendStrengthThreshold = input.float(0.5, title="Trend Güç Daralma Eşiği (%)", minval=0.1, maxval=30.0, step=0.1, group="Yeni Sinyal Ayarları")
+float bandMultiplier = input.float(1.6, title="Bant Çarpanı", minval=0.1, maxval=10.0, step=0.1, group="Yeni Sinyal Ayarları")
+int breachLookback = input.int(3, title="Taşma Geri Dönüş Mum Sayısı", minval=1, maxval=30, group="Yeni Sinyal Ayarları")
+float longRsiApproachThreshold = input.float(15.0, title="Long RSI Yaklaşma Mesafesi", minval=1.0, maxval=99.0, group="Yeni Sinyal Ayarları")
+float shortRsiApproachThreshold = input.float(73.0, title="Short RSI Yaklaşma Mesafesi", minval=1.0, maxval=99.0, group="Yeni Sinyal Ayarları")
+bool reverseTradeOnBreach = input.bool(false, title="Bant İhlalinde Ters İşlem Aç", group="Yeni Sinyal Ayarları")
+float priceChangeThreshold = input.float(0.4, title="Ani Hareket Eşiği (%)", minval=0.1, maxval=20.0, step=0.1, group="Yeni Sinyal Ayarları")
+// TP Sonrası Yeniden Giriş Ayarları (İlk kodan eklendi)
+int reEntryBars = input.int(1, "TP Sonrası Yeniden Giriş Mum Sayısı", minval=1, maxval=10, group="Yeni Sinyal Ayarları", tooltip="TP sonrası kaç mum içinde yeniden giriş yapılacak.")
+float volumeChangeThreshold = input.float(1.0, "Hacim Değişim Eşiği (%)", minval=0.1, maxval=20.0, step=0.1, group="Yeni Sinyal Ayarları", tooltip="Hacim sabit kabul edilmesi için maksimum değişim yüzdesi.")
+bool enableTpReEntry = input.bool(true, "TP Sonrası Yeniden Girişi Etkinleştir", group="Yeni Sinyal Ayarları", tooltip="TP sonrası aynı yönde yeniden girişi açar/kapatır.")
+// "Yeni Sinyal Ayarları" grubunun altına ekle zlma adan işleme alma
+bool enableDistanceTrigger = input.bool(true, "Manuel Girişleri Etkinleştir", group="Yeni Sinyal Ayarları", tooltip="Manuel giriş koşullarını açar/kapar.")
+float atrMultiplier = input.float(0.6, "ATR Çarpanı", minval=0, step=0.1, group="Yeni Sinyal Ayarları", tooltip="ZLMA'nın bantlardan ATR çarpanı kadar uzakta olmasını gerektirir.")
+
+// "Yeni Sinyal Ayarları" grubunun altına ekle zlma adan işleme alma
+//tp tampon bölgesi
+// === INPUT: TP Tampon Bölgesi Ayarları ===
+// Yeni Sinyal Ayarları altında
+
+//tp tampon bölgesi
+
+
+
+// CALCULATIONS 
+series float atr = ta.atr(atrLength)
+series float emaValue = ta.ema(close, length)
+series float correction = close + (close - emaValue)
+series float zlma = ta.ema(correction, length)
+series float sma = ta.sma(close, smaLength)
+series float smaSlope = sma - sma[1]
+series float slopeChange = smaSlope - smaSlope[1]
+float trendStrength = math.abs(zlma - sma) / sma * 100
+series float avgVolume = ta.sma(volume, lookback)
+series float volumePct = (volume / avgVolume) * 100
+series float rsi = ta.rsi(close, rsiLength)
+series float rsiChange = rsi - rsi[1]
+series float upperBand = sma + (atr * bandMultiplier)
+series float lowerBand = sma - (atr * bandMultiplier)
+float priceChangeDump = math.abs(low - close[1]) / close[1] * 100  // Dump için low
+float priceChangePump = math.abs(high - close[1]) / close[1] * 100  // Pump için high
+float slopeThreshold = slopeThresholdInput / 100 * close
+series float priceChange = math.abs(close - close[1]) / close[1] * 100
+
+
+// YENİ SİNYAL MANTIĞI - HESAPLAMALAR
+float newNegTotalVolume = math.sum(volume, weakCandleLookback)
+float newPosTotalVolume = math.sum(volume, weakCandleLookback)
+float newNegativeVolume = math.sum(volume * (close < open ? 1 : 0), weakCandleLookback)
+float newPositiveVolume = math.sum(volume * (close > open ? 1 : 0), weakCandleLookback)
+float newNegativeVolumeRatio = (newNegativeVolume / newNegTotalVolume) * 100
+float newPositiveVolumeRatio = (newPositiveVolume / newPosTotalVolume) * 100
+float prevNegVolumeRatio = newNegativeVolumeRatio[1]
+float prevPosVolumeRatio = newPositiveVolumeRatio[1]
+bool negVolumeDecrease = newNegativeVolumeRatio < prevNegVolumeRatio and (prevNegVolumeRatio - newNegativeVolumeRatio) >= longVolumeDecreaseThreshold
+bool posVolumeDecrease = newPositiveVolumeRatio < prevPosVolumeRatio and (prevPosVolumeRatio - newPositiveVolumeRatio) >= shortVolumeDecreaseThreshold
+float prevTrendStrength = trendStrength[1]
+bool trendWeakening = trendStrength < prevTrendStrength and trendStrength <= trendStrengthThreshold
+float rsiChangeCalc = rsi - rsi[1]
+bool rsiApproachingOversold = rsi < rsiOversold + longRsiApproachThreshold and rsiChangeCalc < 0
+bool rsiApproachingOverbought = rsi > rsiOverbought - shortRsiApproachThreshold and rsiChangeCalc > 0
+bool volumeFilter = volumePct > volumeThreshold
+bool newSignalUp = dateFilterApproval and zlma > sma and negVolumeDecrease and trendWeakening and rsiApproachingOversold and volumeFilter
+bool newSignalDn = dateFilterApproval and zlma < sma and posVolumeDecrease and trendWeakening and rsiApproachingOverbought and volumeFilter
+bool confirmedNewSignalUp = ta.valuewhen(newSignalUp, newSignalUp, 0) and newSignalUp[confirmationBars]
+bool confirmedNewSignalDn = ta.valuewhen(newSignalDn, newSignalDn, 0) and newSignalDn[confirmationBars]
+// INPUTS bölümünde mevcut sahte SL inputlarını değiştir
+// INPUTS bölümünde güncelle
+
+
+
+
+
+// SL FİLTRE MANTIĞI
+var bool lastSlWasShort = false
+var bool lastSlWasLong = false
+var int barsSinceLastSl = 0
+var float lastShortSlPrice = na
+var float lastLongSlPrice = na
+float priceChangeSinceSlShort = lastSlWasShort ? close - lastShortSlPrice : na
+float priceChangeSinceSlLong = lastSlWasLong ? close - lastLongSlPrice : na
+
+// TP Sonrası Hacim Karşılaştırması (İlk kodan eklendi)
+var float tpLongCloseBar = na
+var float tpShortCloseBar = na
+if strategy.position_size[1] > 0 and strategy.position_size == 0  // Long TP vurdu
+    tpLongCloseBar := bar_index
+if strategy.position_size[1] < 0 and strategy.position_size == 0  // Short TP vurdu
+    tpShortCloseBar := bar_index
+
+// Sürekli Hesaplanan Hacim Ortalamaları
+series float tpPrevPosVolumeRatio = ta.sma(newPositiveVolumeRatio, reEntryBars)
+series float tpPrevNegVolumeRatio = ta.sma(newNegativeVolumeRatio, reEntryBars)
+series float tpPostPosVolumeRatio = ta.sma(newPositiveVolumeRatio, reEntryBars)
+series float tpPostNegVolumeRatio = ta.sma(newNegativeVolumeRatio, reEntryBars)
+
+// TP Öncesi ve Sonrası Değerleri Saklama
+var float savedPrevPosVolumeRatioLong = na
+var float savedPostPosVolumeRatioLong = na
+var float savedPrevNegVolumeRatioShort = na
+var float savedPostNegVolumeRatioShort = na
+
+if not na(tpLongCloseBar) and bar_index == tpLongCloseBar
+    savedPrevPosVolumeRatioLong := tpPrevPosVolumeRatio[reEntryBars]  // TP öncesi reEntryBars mum ortalaması
+if not na(tpLongCloseBar) and bar_index == tpLongCloseBar + reEntryBars
+    savedPostPosVolumeRatioLong := tpPostPosVolumeRatio  // TP sonrası reEntryBars mum ortalaması
+
+if not na(tpShortCloseBar) and bar_index == tpShortCloseBar
+    savedPrevNegVolumeRatioShort := tpPrevNegVolumeRatio[reEntryBars]  // TP öncesi reEntryBars mum ortalaması
+if not na(tpShortCloseBar) and bar_index == tpShortCloseBar + reEntryBars
+    savedPostNegVolumeRatioShort := tpPostNegVolumeRatio  // TP sonrası reEntryBars mum ortalaması
+
+// Yeniden Giriş Koşulları (İlk kodan eklendi)
+bool longReEntryCondition = enableTpReEntry and not na(tpLongCloseBar) and bar_index > tpLongCloseBar and bar_index <= tpLongCloseBar + reEntryBars and zlma > sma and (savedPostPosVolumeRatioLong >= savedPrevPosVolumeRatioLong or math.abs(savedPostPosVolumeRatioLong - savedPrevPosVolumeRatioLong) < volumeChangeThreshold)
+bool shortReEntryCondition = enableTpReEntry and not na(tpShortCloseBar) and bar_index > tpShortCloseBar and bar_index <= tpShortCloseBar + reEntryBars and zlma < sma and savedPostNegVolumeRatioShort > savedPrevNegVolumeRatioShort and close <= close[1] and close <= sma
+
+
+
+
+
+
+
+
+// STRATEGY LOGIC
+var int lastTradeBar = 0
+int barsSinceLastTrade = bar_index - lastTradeBar
+int minBarsBetweenTrades = 5
+bool validOpenLongPosition = confirmedNewSignalUp and not (strategy.opentrades.size(strategy.opentrades - 1) > 0) and barsSinceLastTrade > minBarsBetweenTrades
+bool validOpenShortPosition = confirmedNewSignalDn and not (strategy.opentrades.size(strategy.opentrades - 1) < 0) and barsSinceLastTrade > minBarsBetweenTrades
+bool longIsActive = validOpenLongPosition or strategy.position_size > 0
+bool shortIsActive = validOpenShortPosition or strategy.position_size < 0
+
+// ZLMA Tabanlı Taşma ve Geri Dönüş
+bool zlmaCrossUp = ta.crossover(close, zlma)
+bool zlmaCrossDown = ta.crossunder(close, zlma)
+var int longZlmaBreachBars = -1
+if zlmaCrossDown and longIsActive
+    longZlmaBreachBars := 0
+else if longZlmaBreachBars >= 0 and longIsActive
+    longZlmaBreachBars := longZlmaBreachBars + 1
+var int shortZlmaBreachBars = -1
+if zlmaCrossUp and shortIsActive
+    shortZlmaBreachBars := 0
+else if shortZlmaBreachBars >= 0 and shortIsActive
+    shortZlmaBreachBars := shortZlmaBreachBars + 1
+bool longZlmaBreachReverted = zlmaCrossUp and longIsActive and longZlmaBreachBars >= 0 and longZlmaBreachBars <= breachLookback
+bool shortZlmaBreachReverted = zlmaCrossDown and shortIsActive and shortZlmaBreachBars >= 0 and shortZlmaBreachBars <= breachLookback
+
+// Ani Hareket Tespiti
+bool significantLongBreach = ta.crossover(high, upperBand) and priceChangePump >= priceChangeThreshold
+bool significantShortBreach = ta.crossunder(low, lowerBand) and priceChangeDump >= priceChangeThreshold
+
+//***************Özel Ani Pump******************
+bool customLongSignal = enableCustomThreshold and priceChange >= priceChangeThreshold and close > close[1] and strategy.position_size == 0 and dateFilterApproval
+bool customShortSignal = enableCustomThreshold and priceChange >= priceChangeThreshold and close < close[1] and strategy.position_size == 0 and dateFilterApproval
+//***************Özel Ani Pump******************
+
+
+// Ters İşlem ve Ani Hareket Koşulları
+bool reverseToLong = dateFilterApproval and shortIsActive and zlmaCrossUp and not shortZlmaBreachReverted and significantLongBreach
+bool reverseToShort = dateFilterApproval and longIsActive and zlmaCrossDown and not longZlmaBreachReverted and significantShortBreach
+//bool fastLongEntry = dateFilterApproval and not longIsActive and not shortIsActive and significantLongBreach and zlma > sma
+//bool fastShortEntry = dateFilterApproval and not longIsActive and not shortIsActive and significantShortBreach and zlma < sma
+bool fastLongEntry = dateFilterApproval and not longIsActive and not shortIsActive and significantLongBreach 
+bool fastShortEntry = dateFilterApproval and not longIsActive and not shortIsActive and significantShortBreach
+
+
+bool forceLongAfterSlShort = enableSlFilter and lastSlWasShort and priceChangeSinceSlShort > 0 and barsSinceLastSl <= slLookbackPeriod
+bool forceShortAfterSlLong = enableSlFilter and lastSlWasLong and priceChangeSinceSlLong < 0 and barsSinceLastSl <= slLookbackPeriod
+
+
+///******son test*******
+// Long Girişte TP’yi Kilitle
+if strategy.position_size > 0 and strategy.position_size[1] <= 0  // Yeni long pozisyon açıldığında
+    lockedLongTpLevel := close * (1 + longTakeProfitPct / 100)
+    globalLongBufferLevel := enableBufferZone ? lockedLongTpLevel * (1 - bufferZonePctLong / 100) : na
+
+// Short Girişte TP Kilitle
+if strategy.position_size < 0 and strategy.position_size[1] >= 0  // Yeni short pozisyon açıldığında
+    lockedShortTpLevel := close * (1 - shortTakeProfitPct / 100)
+    globalShortBufferLevel := enableBufferZone ? lockedShortTpLevel * (1 + bufferZonePctShort / 100) : na
+
+///******son test*******
+float preLongBufferZoneLevel = strategy.position_size > 0 ? globalLongTpLevel * (1 - (bufferZonePctLong + preBufferZonePctLong) / 100) : na
+float preShortBufferZoneLevel = strategy.position_size < 0 ? globalShortTpLevel * (1 + (bufferZonePctShort + preBufferZonePctShort) / 100) : na
+
+//******************gsmbildirimiçin ekler***********************
+//******************gsmbildirimiçin ekler***********************
+
+
+
+
+// Potansiyel Sinyal Bayrakları
+var bool potDelayLong = false
+var bool potDelayShort = false
+var bool potDelayManualLong = false
+var bool potDelayManualShort = false
+var bool potForceLongAfterSlShort = false
+var bool potForceShortAfterSlLong = false
+var bool potFastLongEntry = false
+var bool potFastShortEntry = false
+var bool potLongReEntryCondition = false
+var bool potShortReEntryCondition = false
+var bool potCustomLongSignal = false
+var bool potCustomShortSignal = false
+var bool potLongSlTriggered = false
+var bool potShortSlTriggered = false
+var bool potFakeLongSlTriggered = false
+var bool potFakeShortSlTriggered = false
+var bool potLongTpExit = false
+var bool potShortTpExit = false
+var bool potLongBufferReversal = false
+var bool potShortBufferReversal = false
+var bool potLongNeedleTouch = false
+var bool potShortNeedleTouch = false
+var bool potLongBreachExit = false
+var bool potShortBreachExit = false
+var bool potReverseToLong = false
+var bool potReverseToShort = false
+var bool potLongSlApproaching = false
+var bool potShortSlApproaching = false
+var bool potFakeLongSlApproaching = false
+var bool potFakeShortSlApproaching = false
+var bool potLongTpBufferEntry = false
+var bool potShortTpBufferEntry = false
+var bool preShortBufferZoneEntered = false
+var bool preLongBufferZoneEntered = false
+preLongBufferZoneEntered := strategy.position_size > 0 and close >= preLongBufferZoneLevel and close < globalLongBufferLevel
+preShortBufferZoneEntered := strategy.position_size < 0 and close <= preShortBufferZoneLevel and close > globalShortBufferLevel
+
+// Tehlike durumu bayrakları
+var bool potDangerShortOpen = false
+potDangerShortOpen := strategy.position_size < 0 and not shortIsActive and potDelayLong and not dangerShortAlertSent
+
+var bool potDangerLongOpen = false
+potDangerLongOpen := strategy.position_size > 0 and not longIsActive and potDelayShort and not dangerLongAlertSent
+
+
+
+// Bağımlı Değişkenler için Global Tanımlar
+var float globalLongSlLevel = na
+var float globalShortSlLevel = na
+var float globalFakeLongSlLevel = na
+var float globalFakeShortSlLevel = na
+//*****var float globalLongTpLevel = na
+//****var float globalShortTpLevel = na
+globalLongBufferLevel := lockedLongTpLevel * (1 - bufferZonePctLong / 100)
+globalShortBufferLevel := lockedShortTpLevel * (1 + bufferZonePctShort / 100)
+var bool globalFakeSlActive = true
+
+// SL ve TP Seviyelerini Güncelle
+if longIsActive
+    globalLongSlLevel := strategy.position_avg_price - (atr * atrMultiplierLong)
+    if iz_suren_long_stoploss
+        stopPrice = high - (atr * atrMultiplierLong)
+        globalLongSlLevel := math.max(stopPrice, nz(globalLongSlLevel[1]))
+    globalLongTpLevel := strategy.position_avg_price * (1 + longTakeProfitPct / 100)
+    globalLongBufferLevel := globalLongTpLevel * (1 - bufferZonePctLong / 100)
+if shortIsActive
+    globalShortSlLevel := strategy.position_avg_price + (atr * atrMultiplierShort)
+    if iz_suren_short_stoploss
+        stopPrice = low + (atr * atrMultiplierShort)
+        globalShortSlLevel := math.min(stopPrice, nz(globalShortSlLevel[1], 999999.9))
+    globalShortTpLevel := strategy.position_avg_price * (1 - shortTakeProfitPct / 100)
+    globalShortBufferLevel := globalShortTpLevel * (1 + bufferZonePctShort / 100)
+if enableFakeStopLoss and globalFakeSlActive
+    float longSlDistance = strategy.position_avg_price - globalLongSlLevel
+    float shortSlDistance = globalShortSlLevel - strategy.position_avg_price
+    globalFakeLongSlLevel := longIsActive ? strategy.position_avg_price - (longSlDistance * (fakeSlOffsetPct / 100)) : na
+    globalFakeShortSlLevel := shortIsActive ? strategy.position_avg_price + (shortSlDistance * (fakeSlOffsetPct / 100)) : na
+if strategy.position_size == 0
+    globalLongSlLevel := na
+    globalShortSlLevel := na
+    globalFakeLongSlLevel := na
+    globalFakeShortSlLevel := na
+    globalLongTpLevel := na
+    globalShortTpLevel := na
+    globalLongBufferLevel := na
+    globalShortBufferLevel := na
+    globalFakeSlActive := true
+    // SL ve TP Seviyeleri bloğunda, mevcut global tanımların altına ekle:
+    globalLongBufferLevel := enableBufferZone and not na(lockedLongTpLevel) ? lockedLongTpLevel * (1 - bufferZonePctLong / 100) : na
+    globalShortBufferLevel := enableBufferZone and not na(lockedShortTpLevel) ? lockedShortTpLevel * (1 + bufferZonePctShort / 100) : na
+// Yeni Yaklaşma Mesafeleri
+// Yeni Yaklaşma Mesafeleri (Daraltılmış)
+float longSlApproachLevel = globalLongSlLevel + (atr * atrMultiplierLong * 0.25)  //sl yaklaşma mesafesi
+float shortSlApproachLevel = globalShortSlLevel - (atr * atrMultiplierShort * 0.25)    //sl yaklaşma mesafesi
+float fakeLongSlApproachLevel = enableFakeStopLoss ? globalFakeLongSlLevel + (atr * atrMultiplierLong * 0.25) : na     //sl yaklaşma mesafesi
+float fakeShortSlApproachLevel = enableFakeStopLoss ? globalFakeShortSlLevel - (atr * atrMultiplierShort * 0.25) : na    //sl yaklaşma mesafesi
+// Bayrakları Koşullarla Güncelle
+potDelayLong := validOpenLongPosition and strategy.position_size == 0 and not disableLongTrades and dateFilterApproval
+potDelayShort := validOpenShortPosition and strategy.position_size == 0 and not disableShortTrades and dateFilterApproval
+potDelayManualLong := enableDistanceTrigger and zlma > upperBand and (zlma - upperBand) > atr * atrMultiplier and zlma > sma and not confirmedNewSignalUp and not confirmedNewSignalDn and strategy.position_size == 0 and not manualWaiting and not disableLongTrades and dateFilterApproval
+potDelayManualShort := enableDistanceTrigger and zlma < lowerBand and (lowerBand - zlma) > atr * atrMultiplier and zlma < sma and not confirmedNewSignalUp and not confirmedNewSignalDn and strategy.position_size == 0 and not manualWaiting and not disableShortTrades and dateFilterApproval
+potForceLongAfterSlShort := enableSlFilter and lastSlWasShort and priceChangeSinceSlShort > 0 and barsSinceLastSl <= slLookbackPeriod
+potForceShortAfterSlLong := enableSlFilter and lastSlWasLong and priceChangeSinceSlLong < 0 and barsSinceLastSl <= slLookbackPeriod
+potFastLongEntry := dateFilterApproval and not longIsActive and not shortIsActive and significantLongBreach
+potFastShortEntry := dateFilterApproval and not longIsActive and not shortIsActive and significantShortBreach
+potLongReEntryCondition := enableTpReEntry and not na(tpLongCloseBar) and bar_index > tpLongCloseBar and bar_index <= tpLongCloseBar + reEntryBars and zlma > sma and (savedPostPosVolumeRatioLong >= savedPrevPosVolumeRatioLong or math.abs(savedPostPosVolumeRatioLong - savedPrevPosVolumeRatioLong) < volumeChangeThreshold)
+potShortReEntryCondition := enableTpReEntry and not na(tpShortCloseBar) and bar_index > tpShortCloseBar and bar_index <= tpShortCloseBar + reEntryBars and zlma < sma and savedPostNegVolumeRatioShort > savedPrevNegVolumeRatioShort and close <= close[1] and close <= sma
+potCustomLongSignal := enableCustomThreshold and priceChange >= priceChangeThreshold and close > close[1] and strategy.position_size == 0 and dateFilterApproval
+potCustomShortSignal := enableCustomThreshold and priceChange >= priceChangeThreshold and close < close[1] and strategy.position_size == 0 and dateFilterApproval
+potLongSlTriggered := longIsActive and close <= globalLongSlLevel and sma <= globalLongSlLevel and not disableStopLoss
+potShortSlTriggered := shortIsActive and close >= globalShortSlLevel and sma >= globalShortSlLevel and not disableStopLoss
+potFakeLongSlTriggered := enableFakeStopLoss and globalFakeSlActive and longIsActive and close <= globalFakeLongSlLevel
+potFakeShortSlTriggered := enableFakeStopLoss and globalFakeSlActive and shortIsActive and close >= globalFakeShortSlLevel
+potLongTpExit := not enableTpTouch and strategy.position_size > 0 and close >= globalLongTpLevel and not longZlmaBreachReverted
+potShortTpExit := not enableTpTouch and strategy.position_size < 0 and close <= globalShortTpLevel and not shortZlmaBreachReverted
+potLongBufferReversal := enableBufferZone and strategy.position_size > 0 and close[1] >= globalLongBufferLevel and close[1] < globalLongTpLevel and close < globalLongBufferLevel and not signalSentThisBar and dateFilterApproval
+potShortBufferReversal := enableBufferZone and strategy.position_size < 0 and close[1] <= globalShortBufferLevel and close[1] > globalShortTpLevel and close > globalShortBufferLevel and not signalSentThisBar and dateFilterApproval
+potLongNeedleTouch := enableBufferZone and strategy.position_size > 0 and high >= globalLongTpLevel and close < globalLongTpLevel and not signalSentThisBar and dateFilterApproval
+potShortNeedleTouch := enableBufferZone and strategy.position_size < 0 and low <= globalShortTpLevel and close > globalShortTpLevel and not signalSentThisBar and dateFilterApproval
+potLongBreachExit := longIsActive and significantShortBreach and not disableStopLoss
+potShortBreachExit := shortIsActive and significantLongBreach and not disableStopLoss
+potReverseToLong := dateFilterApproval and shortIsActive and zlmaCrossUp and not shortZlmaBreachReverted and significantLongBreach and reverseTradeOnBreach
+potReverseToShort := dateFilterApproval and longIsActive and zlmaCrossDown and not longZlmaBreachReverted and significantShortBreach and reverseTradeOnBreach
+
+// Yeni Bayrakları Koşullarla Güncelle
+potLongSlApproaching := longIsActive and close > globalLongSlLevel and close <= longSlApproachLevel and not disableStopLoss
+potShortSlApproaching := shortIsActive and close < globalShortSlLevel and close >= shortSlApproachLevel and not disableStopLoss
+potFakeLongSlApproaching := enableFakeStopLoss and globalFakeSlActive and longIsActive and close > globalFakeLongSlLevel and close <= fakeLongSlApproachLevel
+potFakeShortSlApproaching := enableFakeStopLoss and globalFakeSlActive and shortIsActive and close < globalFakeShortSlLevel and close >= fakeShortSlApproachLevel
+potLongTpBufferEntry := strategy.position_size > 0 and close >= globalLongBufferLevel and close < globalLongTpLevel
+potShortTpBufferEntry := strategy.position_size < 0 and close <= globalShortBufferLevel and close > globalShortTpLevel
+
+
+
+
+//*********************************************************
+//******************gsmbildirimiçin ekler***********************
+
+
+
+
+
+
+
+
+
+
+
+//STRATEGY LOGIC bölümünden sonra, ama STRATEGY EXECUTIONdan önce ekleyeceğiz:
+//  bölümünde mevcut sahte SL inputlarını değiştir
+// Manuel girişlerin durumunu takip eden bayrak
+//var bool manualWaiting = false
+
+// Boşluk ve Teyit Koşulları
+bool manualLongCondition = enableDistanceTrigger and zlma > upperBand and (zlma - upperBand) > atr * atrMultiplier and zlma > sma and not confirmedNewSignalUp and not confirmedNewSignalDn and strategy.position_size == 0 and not manualWaiting
+bool manualShortCondition = enableDistanceTrigger and zlma < lowerBand and (lowerBand - zlma) > atr * atrMultiplier and zlma < sma and not confirmedNewSignalUp and not confirmedNewSignalDn and strategy.position_size == 0 and not manualWaiting
+
+// Gecikme Mekanizması
+var bool delayManualLong = false
+var bool delayManualShort = false
+
+if manualLongCondition and not disableLongTrades and dateFilterApproval
+    delayManualLong := true
+else
+    delayManualLong := false
+
+if manualShortCondition and not disableShortTrades and dateFilterApproval
+    delayManualShort := true
+else
+    delayManualShort := false
+
+// Pozisyon açıldığında beklemeye geç, kapandığında sıfırla
+if (delayManualLong[1] or delayManualShort[1]) and barstate.isconfirmed and strategy.position_size != 0
+    manualWaiting := true
+if strategy.position_size == 0
+    manualWaiting := false
+// Mesafe Hesaplamaları
+
+
+
+
+
+// DEBUG ETİKETLERİ
+if zlmaCrossDown and longIsActive
+    label.new(bar_index, low - atr, "Long ZLMA Taşma\nBars: " + str.tostring(longZlmaBreachBars), color=color.purple, textcolor=color.white, style=label.style_label_up)
+if longZlmaBreachBars >= 0 and longIsActive
+    label.new(bar_index, high + atr, "Long ZLMA Sayım: " + str.tostring(longZlmaBreachBars), color=color.purple, textcolor=color.white, style=label.style_label_down)
+if longZlmaBreachReverted
+    label.new(bar_index, zlma, "Long ZLMA Geri Dönüş\nBars: " + str.tostring(longZlmaBreachBars), color=color.green, textcolor=color.black, style=label.style_label_down)
+if zlmaCrossUp and shortIsActive
+    label.new(bar_index, high + atr, "Short ZLMA Taşma\nBars: " + str.tostring(shortZlmaBreachBars), color=color.purple, textcolor=color.white, style=label.style_label_down)
+if shortZlmaBreachBars >= 0 and shortIsActive
+    label.new(bar_index, low - atr, "Short ZLMA Sayım: " + str.tostring(shortZlmaBreachBars), color=color.purple, textcolor=color.white, style=label.style_label_up)
+if shortZlmaBreachReverted
+    label.new(bar_index, zlma, "Short ZLMA Geri Dönüş\nBars: " + str.tostring(shortZlmaBreachBars), color=color.green, textcolor=color.black, style=label.style_label_up)
+if newSignalUp and not confirmedNewSignalUp
+    label.new(bar_index, high + atr, "Long Potansiyel\nNegVol%: " + str.tostring(newNegativeVolumeRatio) + "\nRSI: " + str.tostring(rsi), color=color.yellow, textcolor=color.black, style=label.style_label_down)
+if newSignalDn and not confirmedNewSignalDn
+    label.new(bar_index, low - atr, "Short Potansiyel\nPosVol%: " + str.tostring(newPositiveVolumeRatio) + "\nRSI: " + str.tostring(rsi), color=color.yellow, textcolor=color.black, style=label.style_label_up)
+if confirmedNewSignalUp
+    label.new(bar_index, high + atr, "Yeni Long", color=color.green, textcolor=color.white, style=label.style_label_down)
+if confirmedNewSignalDn
+    label.new(bar_index, low - atr, "Yeni Short", color=color.red, textcolor=color.white, style=label.style_label_up)
+if lastSlWasShort and barsSinceLastSl <= slLookbackPeriod
+    label.new(bar_index, high, "SL Short Sonrası\nPriceChange: " + str.tostring(priceChangeSinceSlShort) + "\nBars: " + str.tostring(barsSinceLastSl), color=color.orange, textcolor=color.black, style=label.style_label_down)
+if lastSlWasLong and barsSinceLastSl <= slLookbackPeriod
+    label.new(bar_index, low, "SL Long Sonrası\nPriceChange: " + str.tostring(priceChangeSinceSlLong) + "\nBars: " + str.tostring(barsSinceLastSl), color=color.orange, textcolor=color.black, style=label.style_label_up)
+if forceLongAfterSlShort
+    label.new(bar_index, close, "Force Long Tetiklendi", color=color.green, textcolor=color.black, style=label.style_label_down)
+if forceShortAfterSlLong
+    label.new(bar_index, close, "Force Short Tetiklendi", color=color.red, textcolor=color.black, style=label.style_label_up)
+
+//*********************************************************
+//******************gsmbildirimiçin ekler***********************
+
+
+
+
+
+// DEBUG ETİKETLERİ
+if zlmaCrossDown and longIsActive
+    label.new(bar_index, low - atr, "Long ZLMA Taşma\nBars: " + str.tostring(longZlmaBreachBars), color=color.purple, textcolor=color.white, style=label.style_label_up)
+
+// Potansiyel Enter Long (Normal)
+if potDelayLong
+    alert("Potansiyel Enter Long (Normal) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "Potansiyel Enter Long", color=color.green, textcolor=color.white, style=label.style_label_down)
+
+// Potansiyel Enter Short (Normal)
+if potDelayShort
+    alert("Potansiyel Enter Short (Normal) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "Potansiyel Enter Short", color=color.red, textcolor=color.white, style=label.style_label_up)
+
+// Potansiyel Enter Long (Manuel)
+if potDelayManualLong
+    alert("Potansiyel Enter Long (Manuel) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "Potansiyel Enter Long (Manuel)", color=color.green, textcolor=color.white, style=label.style_label_down)
+
+// Potansiyel Enter Short (Manuel)
+if potDelayManualShort
+    alert("Potansiyel Enter Short (Manuel) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "Potansiyel Enter Short (Manuel)", color=color.red, textcolor=color.white, style=label.style_label_up)
+
+// Potansiyel Enter Long (Force)
+if potForceLongAfterSlShort
+    alert("Potansiyel Enter Long (Force) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "Potansiyel Enter Long (Force)", color=color.green, textcolor=color.white, style=label.style_label_down)
+
+// Potansiyel Enter Short (Force)
+if potForceShortAfterSlLong
+    alert("Potansiyel Enter Short (Force) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "Potansiyel Enter Short (Force)", color=color.red, textcolor=color.white, style=label.style_label_up)
+
+
+// Potansiyel Enter Long (TP ReEntry)
+if potLongReEntryCondition
+    alert("Potansiyel Enter Long (TP ReEntry) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "Potansiyel Enter Long (TP ReEntry)", color=color.green, textcolor=color.white, style=label.style_label_down)
+
+// Potansiyel Enter Short (TP ReEntry)
+if potShortReEntryCondition
+    alert("Potansiyel Enter Short (TP ReEntry) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "Potansiyel Enter Short (TP ReEntry)", color=color.red, textcolor=color.white, style=label.style_label_up)
+
+// Potansiyel Enter Long (Custom Pump)
+if potCustomLongSignal
+    alert("Potansiyel Enter Long (Custom Pump) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "Potansiyel Enter Long (Custom)", color=color.green, textcolor=color.white, style=label.style_label_down)
+
+// Potansiyel Enter Short (Custom Dump)
+if potCustomShortSignal
+    alert("Potansiyel Enter Short (Custom Dump) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "Potansiyel Enter Short (Custom)", color=color.red, textcolor=color.white, style=label.style_label_up)
+
+// Potansiyel Exit Long (SL)
+if potLongSlTriggered
+    alert("Potansiyel Exit Long (SL) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "Potansiyel Exit Long (SL)", color=color.orange, textcolor=color.white, style=label.style_label_down)
+
+// Potansiyel Exit Short (SL)
+if potShortSlTriggered
+    alert("Potansiyel Exit Short (SL) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "Potansiyel Exit Short (SL)", color=color.orange, textcolor=color.white, style=label.style_label_up)
+
+// Potansiyel Exit Long (Fake SL)
+if potFakeLongSlTriggered
+    alert("Potansiyel Exit Long (Fake SL) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "Potansiyel Exit Long (Fake SL)", color=color.orange, textcolor=color.white, style=label.style_label_down)
+
+// Potansiyel Exit Short (Fake SL)
+if potFakeShortSlTriggered
+    alert("Potansiyel Exit Short (Fake SL) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "Potansiyel Exit Short (Fake SL)", color=color.orange, textcolor=color.white, style=label.style_label_up)
+
+
+
+// Potansiyel Exit Long (İğne Teması)
+if potLongNeedleTouch
+    alert("Potansiyel Exit Long (Needle Touch) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "Potansiyel Exit Long (Needle)", color=color.orange, textcolor=color.white, style=label.style_label_down)
+
+// Potansiyel Exit Short (İğne Teması)
+if potShortNeedleTouch
+    alert("Potansiyel Exit Short (Needle Touch) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "Potansiyel Exit Short (Needle)", color=color.orange, textcolor=color.white, style=label.style_label_up)
+
+
+// Potansiyel Exit Short ve Enter Long (Reverse)
+if potReverseToLong
+    alert("Potansiyel Exit Short (Reverse to Long) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "Potansiyel Exit Short (Reverse)", color=color.orange, textcolor=color.white, style=label.style_label_up)
+
+// Potansiyel Exit Long ve Enter Short (Reverse)
+if potReverseToShort
+    alert("Potansiyel Exit Long (Reverse to Short) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "Potansiyel Exit Long (Reverse)", color=color.orange, textcolor=color.white, style=label.style_label_down)
+// Ani Pump/Dump için Güncellenmiş Debug Etiketleri ve Alert’lar
+if potFastLongEntry
+    alert("ACİL: Ani Pump! - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "Ani Pump (Acil)", color=color.red, textcolor=color.white, style=label.style_label_down)
+
+if potFastShortEntry
+    alert("ACİL: Ani Dump! - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "Ani Dump (Acil)", color=color.red, textcolor=color.white, style=label.style_label_up)
+
+if potLongBreachExit
+    alert("ACİL: Ani Dump (Çıkış)! - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "Ani Dump Çıkış (Acil)", color=color.red, textcolor=color.white, style=label.style_label_up)
+
+if potShortBreachExit
+    alert("ACİL: Ani Pump (Çıkış)! - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "Ani Pump Çıkış (Acil)", color=color.red, textcolor=color.white, style=label.style_label_down)
+
+
+// Yeni Debug Etiketleri ve Alert’lar
+if potLongSlApproaching
+    alert("Potansiyel SL’ye Yaklaşım (Normal) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "SL’ye Yaklaşıyor (Normal)", color=color.yellow, textcolor=color.black, style=label.style_label_down)
+
+if potShortSlApproaching
+    alert("Potansiyel SL’ye Yaklaşım (Normal) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+label.new(bar_index, low - atr, "SL’ye Yaklaşıyor (Normal)", color=color.yellow, textcolor=color.black, style=label.style_label_up)
+
+
+if potFakeLongSlApproaching
+    alert("Potansiyel SL’ye Yaklaşım (Sahte) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "SL’ye Yaklaşıyor (Sahte)", color=color.yellow, textcolor=color.black, style=label.style_label_down)
+
+if potFakeShortSlApproaching
+    alert("Potansiyel SL’ye Yaklaşım (Sahte) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "SL’ye Yaklaşıyor (Sahte)", color=color.yellow, textcolor=color.black, style=label.style_label_up)
+
+if potLongTpBufferEntry
+    alert("Potansiyel TP Tampon Bölge (Hırsız Alarmı) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "TP Tampon Bölge (Alarm)", color=color.green, textcolor=color.white, style=label.style_label_down)
+
+if potShortTpBufferEntry
+    alert("Potansiyel TP Tampon Bölge (Hırsız Alarmı) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "TP Tampon Bölge (Alarm)", color=color.green, textcolor=color.white, style=label.style_label_up)
+
+if potLongTpBufferEntry
+    alert("Potansiyel TP Tampon Bölge (Hırsız Alarmı) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "TP Tampon Bölge (Alarm)", color=color.green, textcolor=color.white, style=label.style_label_down)
+
+if potShortTpBufferEntry
+    alert("Potansiyel TP Tampon Bölge (Hırsız Alarmı) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "TP Tampon Bölge (Alarm)", color=color.green, textcolor=color.white, style=label.style_label_up)
+
+if preLongBufferZoneEntered
+    alert("Ön Tampon Bölgeye Girildi (Long) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, high + atr, "Ön Tampon Bölge (Alarm)", color=color.green, textcolor=color.white, style=label.style_label_down)
+
+if preShortBufferZoneEntered
+    alert("Ön Tampon Bölgeye Girildi (Short) - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_all)
+    label.new(bar_index, low - atr, "Ön Tampon Bölge (Alarm)", color=color.green, textcolor=color.white, style=label.style_label_up)
+
+
+//*********************************************************
+//******************gsmbildirimiçin ekler***********************
+
+
+// ALERT FUNCTION
+takeProfitQuantityPerc = 100
+group_strategy = "============ OKX Ayarları ============"
+var ALERTGRP_CRED = "OKX Alarm Ayarları"
+//signalToken = 'eXrYUCI72Olljy4pDvGv9/8+iHU2iW6Zn/Cr/8BRlI31Wc/hvbmCg/AqfXhIh+ohUOL+IlqQxP/bsVUZR6vIpw=='  // murat gercek
+signalToken = '6XBnLSR9npli/quATe0XdP9JD+Y/Bavm1B2Uwz+cBcwn1MkszpWkXwUii+9yN707hLABC/BURas8D4GCTaZbgQ=='  // murat test
+enterOrderType = 'market'
+enterOrderPriceOffset = 0
+enterInvestmentType = 'percentage_balance'
+enterAmount = input.float(99, "Bot Giriş Yüzdesi", minval=0.01, inline="31", group=ALERTGRP_CRED, tooltip='OKX Borsasına paranızın tamamının yüzde(%) kaçı ile alım yapacağı miktarı bildirir.')
+maxLag = 300
+exitOrderType = 'market'
+exitOrderPriceOffset = 0
+exitInvestmentType = 'percentage_position'
+exitAmount = 100
+
+getAlertMsg(action, signalToken, maxLag, orderType, orderPriceOffset, investmentType, amount) =>
+    str = '{'
+    str := str + '"action": "' + action + '", '
+    str := str + '"instrument": "' + syminfo.ticker + '", '
+    str := str + '"signalToken": "' + signalToken + '", '
+    str := str + '"timestamp": "' + str.format_time(timenow, "yyyy-MM-dd\'T\'HH:mm:ssZ", "UTC+3") + '", '
+    str := str + '"maxLag": "' + str.tostring(maxLag) + '", '
+    str := str + '"orderType": "' + orderType + '", '
+    str := str + '"orderPriceOffset": "' + str.tostring(orderPriceOffset) + '", '
+    str := str + '"investmentType": "' + investmentType + '", '
+    str := str + '"amount": "' + str.tostring(amount) + '"'
+    str := str + '}'
+    str
+
+getOrderAlertMsgExit(action, signalToken, maxLag, orderType, investmentType, amount) =>
+    str = '{'
+    str := str + '"action": "' + action + '", '
+    str := str + '"instrument": "' + syminfo.ticker + '", '
+    str := str + '"signalToken": "' + signalToken + '", '
+    str := str + '"timestamp": "' + str.format_time(timenow, "yyyy-MM-dd\'T\'HH:mm:ssZ", "UTC+3") + '", '
+    str := str + '"maxLag": "' + str.tostring(maxLag) + '", '
+    str := str + '"orderType": "' + orderType + '", '
+    str := str + '"investmentType": "' + investmentType + '", '
+    str := str + '"amount": "' + str.tostring(amount) + '"'
+    str := str + '}'
+    str
+
+long_entry = 'ENTER_LONG'
+long_exit = 'EXIT_LONG'
+short_entry = 'ENTER_SHORT'
+short_exit = 'EXIT_SHORT' 
+
+buyAlertMsgLong = getAlertMsg(action=long_entry, signalToken=signalToken, maxLag=maxLag, orderType=enterOrderType, orderPriceOffset=enterOrderPriceOffset, investmentType=enterInvestmentType, amount=enterAmount)
+buyAlertMsgShort = getAlertMsg(action=short_entry, signalToken=signalToken, maxLag=maxLag, orderType=enterOrderType, orderPriceOffset=enterOrderPriceOffset, investmentType=enterInvestmentType, amount=enterAmount)
+sellAlertMsgLong = getOrderAlertMsgExit(action=long_exit, signalToken=signalToken, maxLag=maxLag, orderType=exitOrderType, investmentType=exitInvestmentType, amount=exitAmount)
+sellAlertMsgShort = getOrderAlertMsgExit(action=short_exit, signalToken=signalToken, maxLag=maxLag, orderType=exitOrderType, investmentType=exitInvestmentType, amount=exitAmount)
+sellTakeProfitAlertMsgLong = getOrderAlertMsgExit(action=long_exit, signalToken=signalToken, maxLag=maxLag, orderType=exitOrderType, investmentType=exitInvestmentType, amount=takeProfitQuantityPerc)
+sellTakeProfitAlertMsgShort = getOrderAlertMsgExit(action=short_exit, signalToken=signalToken, maxLag=maxLag, orderType=exitOrderType, investmentType=exitInvestmentType, amount=takeProfitQuantityPerc)
+
+// TAKE PROFIT VE STOP-LOSS
+float shortTakeProfitLevel = strategy.position_size < 0 ? strategy.position_avg_price * (1 - shortTakeProfitPct / 100) : na
+float longTakeProfitLevel = strategy.position_size > 0 ? strategy.position_avg_price * (1 + longTakeProfitPct / 100) : na
+float longBufferZoneLevel = strategy.position_size > 0 ? longTakeProfitLevel * (1 - bufferZonePctLong / 100) : na
+float shortBufferZoneLevel = strategy.position_size < 0 ? shortTakeProfitLevel * (1 + bufferZonePctShort / 100) : na
+// Yeni ön tampon bölge seviyeleri kalkan 
+//***float preLongBufferZoneLevel = strategy.position_size > 0 ? lockedLongTpLevel * (1 - (bufferZonePctLong + preBufferZonePctLong) / 100) : na
+//****float preShortBufferZoneLevel = strategy.position_size < 0 ? lockedShortTpLevel * (1 + (bufferZonePctShort + preBufferZonePctShort) / 100) : na
+
+
+// === TAMPON BÖLGE GİRİŞ DURUMLARI ===
+bool longBufferZoneEntered  = enableBufferZone and longIsActive  and close >= longBufferZoneLevel and close < longTakeProfitLevel
+bool shortBufferZoneEntered = enableBufferZone and shortIsActive and close <= shortBufferZoneLevel and close > shortTakeProfitLevel
+// Yeni ön tampon bölge giriş koşulları  kalkan 
+//*****bool preLongBufferZoneEntered = enableBufferZone and longIsActive and close >= preLongBufferZoneLevel and close < longBufferZoneLevel
+//*****bool preShortBufferZoneEntered = enableBufferZone and shortIsActive and close <= preShortBufferZoneLevel and close > shortBufferZoneLevel
+// === GERI DÖNÜŞ DURUMLARI ===
+bool longBufferZoneReversal  = longBufferZoneEntered[1]  and close < longBufferZoneLevel  and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+bool shortBufferZoneReversal = shortBufferZoneEntered[1] and close > shortBufferZoneLevel and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+// Yeni ön tampon bölge geri dönüş koşulları  kalkan 
+bool preLongBufferZoneReversal = preLongBufferZoneEntered[1] and close < preLongBufferZoneLevel and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+bool preShortBufferZoneReversal = preShortBufferZoneEntered[1] and close > preShortBufferZoneLevel and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+// === İĞNE TEMASI DURUMLARI ===
+bool longNeedleTouch  = enableBufferZone and longIsActive  and high >= longTakeProfitLevel  and close < longTakeProfitLevel  and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+bool shortNeedleTouch = enableBufferZone and shortIsActive and low  <= shortTakeProfitLevel and close > shortTakeProfitLevel and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+
+// === SAYAÇLAR ===
+var int bufferLabelCounterLong  = 0
+var int bufferLabelCounterShort = 0
+//tp Tampon Bölge Seviyeleri
+
+
+
+
+getLongStopLossPrice(basePrice) =>
+    basePrice - (atr * atrMultiplierLong)
+
+getShortStopLossPrice(basePrice) =>
+    basePrice + (atr * atrMultiplierShort)
+
+longbaslangic = longIsActive and longIsActive[1] == false
+var float longStopLossLevel = na
+longStopLossLevel := if (longIsActive)
+    if (validOpenLongPosition)
+        getLongStopLossPrice(strategy.position_avg_price)
+    else if (iz_suren_long_stoploss)
+        stopPrice = getLongStopLossPrice(high)
+        math.max(stopPrice, nz(longStopLossLevel[1]))
+    else
+        longStopLossLevel[1]
+else
+    na
+
+shortbaslangic = shortIsActive and shortIsActive[1] == false
+var float shortStopLossLevel = na
+shortStopLossLevel := if (shortIsActive)
+    if (validOpenShortPosition)
+        getShortStopLossPrice(strategy.position_avg_price)
+    else if (iz_suren_short_stoploss)
+        stopPrice = getShortStopLossPrice(low)
+        math.min(stopPrice, nz(shortStopLossLevel[1], 999999.9))
+    else
+        shortStopLossLevel[1]
+else
+    na
+
+// SL Tetikleme Mantığı (SMA ile)
+bool longSlTriggered = longIsActive and close <= longStopLossLevel and sma <= longStopLossLevel and not disableStopLoss
+bool shortSlTriggered = shortIsActive and close >= shortStopLossLevel and sma >= shortStopLossLevel and not disableStopLoss
+
+// Debug için SL etiketleri
+if longSlTriggered
+    label.new(bar_index, low - atr, "SL Long Tetiklendi\nSMA: " + str.tostring(sma) + "\nSL: " + str.tostring(longStopLossLevel), color=color.red, textcolor=color.white, style=label.style_label_up)
+if shortSlTriggered
+    label.new(bar_index, high + atr, "SL Short Tetiklendi\nSMA: " + str.tostring(sma) + "\nSL: " + str.tostring(shortStopLossLevel), color=color.red, textcolor=color.white, style=label.style_label_down)
+
+// Sahte Stop-Loss Seviyeleri  *****************************************
+// TAKE PROFIT VE STOP-LOSS bölümünde, sahte SL hesaplamalarının üstüne ekle
+var bool fakeSlActive = true  // Sahte SL başlangıçta aktif
+
+// Sahte Stop-Loss Seviyeleri (Gerçek SL’ye paralel)
+float fakeLongStopLossLevel = na
+float fakeShortStopLossLevel = na
+
+if enableFakeStopLoss and fakeSlActive
+    // Gerçek SL ile giriş fiyatı arasındaki mesafeyi hesapla
+    float longSlDistance = strategy.position_avg_price - longStopLossLevel
+    float shortSlDistance = shortStopLossLevel - strategy.position_avg_price
+    
+    // Sahte SL’yi gerçek SL’den kaydır
+    fakeLongStopLossLevel := longIsActive ? strategy.position_avg_price - (longSlDistance * (fakeSlOffsetPct / 100)) : na
+    fakeShortStopLossLevel := shortIsActive ? strategy.position_avg_price + (shortSlDistance * (fakeSlOffsetPct / 100)) : na
+
+// Sahte Stop-Loss Tetikleme (fakeSlActive kontrolü ekleniyor)
+bool fakeLongSlTriggered = enableFakeStopLoss and fakeSlActive and longIsActive and close <= fakeLongStopLossLevel and barstate.isconfirmed
+bool fakeShortSlTriggered = enableFakeStopLoss and fakeSlActive and shortIsActive and close >= fakeShortStopLossLevel and barstate.isconfirmed
+
+// Sahte SL tetiklendiğinde devre dışı bırak
+if fakeLongSlTriggered or fakeShortSlTriggered
+    fakeSlActive := false
+
+// Pozisyon kapandığında sıfırla
+if strategy.position_size == 0
+    fakeSlActive := true
+// Debug için Sahte SL Etiketleri
+if fakeLongSlTriggered and not signalSentThisBar
+    label.new(bar_index, low - atr, "Sahte SL Long Tetiklendi\nSeviye: " + str.tostring(fakeLongStopLossLevel, "#.##"), color=color.orange, textcolor=color.white, style=label.style_label_up)
+
+if fakeShortSlTriggered and not signalSentThisBar
+    label.new(bar_index, high + atr, "Sahte SL Short Tetiklendi\nSeviye: " + str.tostring(fakeShortStopLossLevel, "#.##"), color=color.orange, textcolor=color.white, style=label.style_label_down)
+// Sahte Stop-Loss Seviyeleri  ******************************************
+
+
+
+
+
+
+
+
+
+
+// STRATEGY EXECUTION
+var bool delayLong = false
+var bool delayShort = false
+
+if validOpenLongPosition and strategy.position_size == 0 and not disableLongTrades and dateFilterApproval
+    delayLong := true
+else
+    delayLong := false
+
+if validOpenShortPosition and strategy.position_size == 0 and not disableShortTrades and dateFilterApproval
+    delayShort := true
+else
+    delayShort := false
+
+// SL Filtresi ile Giriş Koşulları
+bool canEnterLong = not enableSlFilter or (enableSlFilter and not lastSlWasLong) or (enableSlFilter and lastSlWasLong and priceChangeSinceSlLong > 0 and barsSinceLastSl <= slLookbackPeriod)
+bool canEnterShort = not enableSlFilter or (enableSlFilter and not lastSlWasShort) or (enableSlFilter and lastSlWasShort and priceChangeSinceSlShort < 0 and barsSinceLastSl <= slLookbackPeriod)
+
+// Girişler
+if delayLong[1] and barstate.isconfirmed and strategy.position_size == 0 and not disableLongTrades and not signalSentThisBar and dateFilterApproval and canEnterLong
+    strategy.entry(id="Long", direction=strategy.long, alert_message=buyAlertMsgLong)
+    alert(buyAlertMsgLong, alert.freq_once_per_bar_close)
+    label.new(bar_index, high + atr, "ENTER_LONG Alert", color=color.blue, textcolor=color.white, style=label.style_label_down)
+    delayLong := false
+    lastTradeBar := bar_index
+    signalSentThisBar := true
+    if lastSlWasShort
+        lastSlWasShort := false
+
+if delayShort[1] and barstate.isconfirmed and strategy.position_size == 0 and not disableShortTrades and not signalSentThisBar and dateFilterApproval and canEnterShort
+    strategy.entry(id="Short", direction=strategy.short, alert_message=buyAlertMsgShort)
+    alert(buyAlertMsgShort, alert.freq_once_per_bar_close)
+    label.new(bar_index, low - atr, "ENTER_SHORT Alert", color=color.blue, textcolor=color.white, style=label.style_label_up)
+    delayShort := false
+    lastTradeBar := bar_index
+    signalSentThisBar := true
+    if lastSlWasLong
+        lastSlWasLong := false
+
+if forceLongAfterSlShort and strategy.position_size == 0 and not disableLongTrades and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.entry(id="Long", direction=strategy.long, comment="SL Short sonrası Long", alert_message=buyAlertMsgLong)
+    alert(buyAlertMsgLong, alert.freq_once_per_bar_close)
+    label.new(bar_index, high + atr, "FORCE_LONG Alert", color=color.blue, textcolor=color.white, style=label.style_label_down)
+    lastTradeBar := bar_index
+    signalSentThisBar := true
+    lastSlWasShort := false
+
+if forceShortAfterSlLong and strategy.position_size == 0 and not disableShortTrades and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.entry(id="Short", direction=strategy.short, comment="SL Long sonrası Short", alert_message=buyAlertMsgShort)
+    alert(buyAlertMsgShort, alert.freq_once_per_bar_close)
+    label.new(bar_index, low - atr, "FORCE_SHORT Alert", color=color.blue, textcolor=color.white, style=label.style_label_up)
+    lastTradeBar := bar_index
+    signalSentThisBar := true
+    lastSlWasLong := false
+
+// Ani Pump Long Giriş
+if fastLongEntry and not disableLongTrades and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.entry(id="Long", direction=strategy.long, comment="Ani Pump", alert_message=buyAlertMsgLong)
+    alert(buyAlertMsgLong, alert.freq_once_per_bar_close)
+    label.new(bar_index, high + atr, "ENTER_LONG_PUMP Alert", color=color.blue, textcolor=color.white, style=label.style_label_down)
+    lastTradeBar := bar_index
+    signalSentThisBar := true
+
+// Ani Dump Short Giriş
+if fastShortEntry and not disableShortTrades and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.entry(id="Short", direction=strategy.short, comment="Ani Dump", alert_message=buyAlertMsgShort)
+    alert(buyAlertMsgShort, alert.freq_once_per_bar_close)
+    label.new(bar_index, low - atr, "ENTER_SHORT_DUMP Alert", color=color.blue, textcolor=color.white, style=label.style_label_up)
+    lastTradeBar := bar_index
+    signalSentThisBar := true
+
+// TP Sonrası Yeniden Giriş (İlk kodan eklendi)
+if longReEntryCondition and strategy.position_size == 0 and not disableLongTrades and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.entry(id="Long", direction=strategy.long, comment="TP Sonrası Long", alert_message=buyAlertMsgLong)
+    alert(buyAlertMsgLong, alert.freq_once_per_bar_close)
+    label.new(bar_index, high + atr, "ENTER_LONG_TP_REENTRY\nPosVol%: " + str.tostring(savedPostPosVolumeRatioLong), color=color.green, textcolor=color.white, style=label.style_label_down)
+    lastTradeBar := bar_index
+    signalSentThisBar := true
+
+if shortReEntryCondition and strategy.position_size == 0 and not disableShortTrades and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.entry(id="Short", direction=strategy.short, comment="TP Sonrası Short", alert_message=buyAlertMsgShort)
+    alert(buyAlertMsgShort, alert.freq_once_per_bar_close)
+    label.new(bar_index, low - atr, "ENTER_SHORT_TP_REENTRY\nNegVol%: " + str.tostring(savedPostNegVolumeRatioShort), color=color.red, textcolor=color.white, style=label.style_label_up)
+    lastTradeBar := bar_index
+    signalSentThisBar := true
+
+//STRATEGY EXECUTION bölümünde mevcut girişlerin altına ekleyeceğiz. minBarsBetweenTrades kontrolünü burada kullanmayacağız:
+// Manuel Long Giriş
+if delayManualLong[1] and barstate.isconfirmed and strategy.position_size == 0 and not disableLongTrades and not signalSentThisBar and dateFilterApproval and canEnterLong
+    strategy.entry(id="ManualLong", direction=strategy.long, alert_message=buyAlertMsgLong)
+    alert(buyAlertMsgLong, alert.freq_once_per_bar_close)
+    label.new(bar_index, high + atr, "MANUAL_ENTER_LONG\nMesafe: " + str.tostring(zlma - upperBand, "#.##"), color=color.blue, textcolor=color.white, style=label.style_label_down)
+    delayManualLong := false
+    lastTradeBar := bar_index
+    signalSentThisBar := true
+    if lastSlWasShort
+        lastSlWasShort := false
+
+// Manuel Short Giriş
+if delayShort[1] and barstate.isconfirmed and strategy.position_size == 0 and not disableShortTrades and not signalSentThisBar and dateFilterApproval and canEnterShort
+    strategy.entry(id="Short", direction=strategy.short, alert_message=buyAlertMsgShort)
+    alert(buyAlertMsgShort, alert.freq_once_per_bar_close)
+    label.new(bar_index, low - atr, "ENTER_SHORT Alert", color=color.blue, textcolor=color.white, style=label.style_label_up)
+    delayShort := false
+    lastTradeBar := bar_index
+    signalSentThisBar := true
+    if lastSlWasLong
+        lastSlWasLong := false
+// Mesafe Tabanlı Manuel Long Giriş zlmadan işleme alma 
+if delayManualShort[1] and barstate.isconfirmed and strategy.position_size == 0 and not disableShortTrades and not signalSentThisBar and dateFilterApproval and canEnterShort
+    strategy.entry(id="ManualShort", direction=strategy.short, alert_message=buyAlertMsgShort)
+    alert(buyAlertMsgShort, alert.freq_once_per_bar_close)
+    label.new(bar_index, low - atr, "MANUAL_ENTER_SHORT\nMesafe: " + str.tostring(lowerBand - zlma, "#.##"), color=color.blue, textcolor=color.white, style=label.style_label_up)
+    delayManualShort := false
+    lastTradeBar := bar_index
+    signalSentThisBar := true
+    if lastSlWasLong
+        lastSlWasLong := false
+// STRATEGY EXECUTION içinde girişlerin altına ekle:
+// Long Girişte TP Kilitle
+if strategy.position_size > 0 and strategy.position_size[1] <= 0  // Yeni long pozisyon açıldığında
+    lockedLongTpLevel := close * (1 + longTakeProfitPct / 100)
+
+// Short Girişte TP Kilitle
+if strategy.position_size < 0 and strategy.position_size[1] >= 0  // Yeni short pozisyon açıldığında
+    lockedShortTpLevel := close * (1 - shortTakeProfitPct / 100)
+
+
+
+
+// Çıkışlar
+// Çıkışlar
+// SL Çıkışı
+if longSlTriggered and strategy.position_size > 0 and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.close(id="Long", comment="SL Long", alert_message=sellAlertMsgLong)
+    alert(sellAlertMsgLong, alert.freq_once_per_bar_close)
+    label.new(bar_index, high + atr, "EXIT_LONG_SL Alert", color=color.blue, textcolor=color.white, style=label.style_label_down)
+    signalSentThisBar := true
+    lastSlWasLong := true
+    lastSlWasShort := false
+    barsSinceLastSl := 0
+    lastLongSlPrice := close
+
+if shortSlTriggered and strategy.position_size < 0 and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.close(id="Short", comment="SL Short", alert_message=sellAlertMsgShort)
+    alert(sellAlertMsgShort, alert.freq_once_per_bar_close)
+    label.new(bar_index, low - atr, "EXIT_SHORT_SL Alert", color=color.blue, textcolor=color.white, style=label.style_label_up)
+    signalSentThisBar := true
+    lastSlWasShort := true
+    lastSlWasLong := false
+    barsSinceLastSl := 0
+    lastShortSlPrice := close
+
+// Sahte SL Çıkışları
+if fakeLongSlTriggered and strategy.position_size > 0 and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.close(id="Long", comment="Sahte SL Long", alert_message=sellAlertMsgLong)
+    alert(sellAlertMsgLong, alert.freq_once_per_bar_close)
+    label.new(bar_index, high + atr, "EXIT_FAKE_SL_LONG Alert", color=color.orange, textcolor=color.white, style=label.style_label_down)
+    signalSentThisBar := true
+    lastSlWasLong := true
+    lastSlWasShort := false
+    barsSinceLastSl := 0
+    lastLongSlPrice := close
+
+if fakeShortSlTriggered and strategy.position_size < 0 and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.close(id="Short", comment="Sahte SL Short", alert_message=sellAlertMsgShort)
+    alert(sellAlertMsgShort, alert.freq_once_per_bar_close)
+    label.new(bar_index, low - atr, "EXIT_FAKE_SL_SHORT Alert", color=color.orange, textcolor=color.white, style=label.style_label_up)
+    signalSentThisBar := true
+    lastSlWasShort := true
+    lastSlWasLong := false
+    barsSinceLastSl := 0
+    lastShortSlPrice := close
+
+// TP ve Tampon Bölge Çıkış Koşulları
+potLongTpExit := strategy.position_size > 0 and close >= lockedLongTpLevel
+potShortTpExit := strategy.position_size < 0 and close <= lockedShortTpLevel
+longBufferZoneEntered := enableBufferZone and strategy.position_size > 0 and close >= longBufferZoneLevel and close < lockedLongTpLevel
+shortBufferZoneEntered := enableBufferZone and strategy.position_size < 0 and close <= shortBufferZoneLevel and close > lockedShortTpLevel
+longBufferZoneReversal := longBufferZoneEntered[1] and close < longBufferZoneLevel and not signalSentThisBar and dateFilterApproval
+shortBufferZoneReversal := shortBufferZoneEntered[1] and close > shortBufferZoneLevel and not signalSentThisBar and dateFilterApproval
+longNeedleTouch := enableBufferZone and strategy.position_size > 0 and high >= lockedLongTpLevel and close < lockedLongTpLevel and not signalSentThisBar and dateFilterApproval
+shortNeedleTouch := enableBufferZone and strategy.position_size < 0 and low <= lockedShortTpLevel and close > lockedShortTpLevel and not signalSentThisBar and dateFilterApproval
+// Yeni çıkış koşulları  kalkan 
+//bool preLongBufferZoneEntered = enableBufferZone and strategy.position_size > 0 and close >= preLongBufferZoneLevel and close < longBufferZoneLevel
+//bool preShortBufferZoneEntered = enableBufferZone and strategy.position_size < 0 and close <= preShortBufferZoneLevel and close > shortBufferZoneLevel
+//bool preLongBufferZoneReversal = preLongBufferZoneEntered[1] and close < preLongBufferZoneLevel and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+//bool preShortBufferZoneReversal = preShortBufferZoneEntered[1] and close > preShortBufferZoneLevel and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+// Long Çıkış (TP, Tampon Terki, İğne Teması, Ön Tampon Terki)
+if (potLongTpExit or longBufferZoneReversal or longNeedleTouch or preLongBufferZoneReversal) and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    string exitComment = potLongTpExit ? "EXIT_LONG_TP" : longBufferZoneReversal ? "EXIT_LONG_BUFFER" : longNeedleTouch ? "EXIT_LONG_NEEDLE" : "EXIT_LONG_PRE_BUFFER"
+    strategy.close(id="Long", qty_percent=100, comment=exitComment, alert_message=sellTakeProfitAlertMsgLong)
+    alert("Potansiyel Çıkış (Long) - " + (potLongTpExit ? "TP" : longBufferZoneReversal ? "Tampon Terki" : longNeedleTouch ? "İğne Teması" : "Ön Tampon Terki") + " - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_once_per_bar_close)
+    label.new(bar_index, high + atr, potLongTpExit ? "TP Çıkış (Long)" : longBufferZoneReversal ? "Tampon Çıkış (Long)" : longNeedleTouch ? "İğne Çıkış (Long)" : "Ön Tampon Çıkış (Long)", color=color.green, textcolor=color.white, style=label.style_label_down)
+    signalSentThisBar := true
+
+// Short Çıkış (TP, Tampon Terki, İğne Teması, Ön Tampon Terki)
+if (potShortTpExit or shortBufferZoneReversal or shortNeedleTouch or preShortBufferZoneReversal) and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    string exitComment = potShortTpExit ? "EXIT_SHORT_TP" : shortBufferZoneReversal ? "EXIT_SHORT_BUFFER" : shortNeedleTouch ? "EXIT_SHORT_NEEDLE" : "EXIT_SHORT_PRE_BUFFER"
+    strategy.close(id="Short", qty_percent=100, comment=exitComment, alert_message=sellTakeProfitAlertMsgShort)
+    alert("Potansiyel Çıkış (Short) - " + (potShortTpExit ? "TP" : shortBufferZoneReversal ? "Tampon Terki" : shortNeedleTouch ? "İğne Teması" : "Ön Tampon Terki") + " - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_once_per_bar_close)
+    label.new(bar_index, low - atr, potShortTpExit ? "TP Çıkış (Short)" : shortBufferZoneReversal ? "Tampon Çıkış (Short)" : shortNeedleTouch ? "İğne Çıkış (Short)" : "Ön Tampon Çıkış (Short)", color=color.green, textcolor=color.white, style=label.style_label_up)
+    signalSentThisBar := true
+// Yeni çıkış koşulları  kalkan 
+
+
+
+// Long Çıkış (TP, Tampon Terki, İğne Teması)
+if (potLongTpExit or longBufferZoneReversal or longNeedleTouch) and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    string exitComment = potLongTpExit ? "EXIT_LONG_TP" : longBufferZoneReversal ? "EXIT_LONG_BUFFER" : "EXIT_LONG_NEEDLE"
+    strategy.close(id="Long", qty_percent=100, comment=exitComment, alert_message=sellTakeProfitAlertMsgLong)
+    alert("Potansiyel Çıkış (Long) - " + (potLongTpExit ? "TP" : longBufferZoneReversal ? "Tampon Terki" : "İğne Teması") + " - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_once_per_bar_close)
+    label.new(bar_index, high + atr, potLongTpExit ? "TP Çıkış (Long)" : longBufferZoneReversal ? "Tampon Çıkış (Long)" : "İğne Çıkış (Long)", color=color.green, textcolor=color.white, style=label.style_label_down)
+    signalSentThisBar := true
+
+// Short Çıkış (TP, Tampon Terki, İğne Teması)
+if (potShortTpExit or shortBufferZoneReversal or shortNeedleTouch) and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    string exitComment = potShortTpExit ? "EXIT_SHORT_TP" : shortBufferZoneReversal ? "EXIT_SHORT_BUFFER" : "EXIT_SHORT_NEEDLE"
+    strategy.close(id="Short", qty_percent=100, comment=exitComment, alert_message=sellTakeProfitAlertMsgShort)
+    alert("Potansiyel Çıkış (Short) - " + (potShortTpExit ? "TP" : shortBufferZoneReversal ? "Tampon Terki" : "İğne Teması") + " - Zaman: " + str.tostring(time, "HH:mm:ss"), alert.freq_once_per_bar_close)
+    label.new(bar_index, low - atr, potShortTpExit ? "TP Çıkış (Short)" : shortBufferZoneReversal ? "Tampon Çıkış (Short)" : "İğne Çıkış (Short)", color=color.green, textcolor=color.white, style=label.style_label_up)
+    signalSentThisBar := true
+
+// Bant İhlali Çıkışları
+if longIsActive and significantShortBreach and not disableStopLoss and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.close(id="Long", comment="Bant İhlali", alert_message=sellAlertMsgLong)
+    alert(sellAlertMsgLong, alert.freq_once_per_bar_close)
+    label.new(bar_index, high + atr, "EXIT_LONG_BREACH Alert", color=color.blue, textcolor=color.white, style=label.style_label_down)
+    signalSentThisBar := true
+
+if shortIsActive and significantLongBreach and not disableStopLoss and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.close(id="Short", comment="Bant İhlali", alert_message=sellAlertMsgShort)
+    alert(sellAlertMsgShort, alert.freq_once_per_bar_close)
+    label.new(bar_index, low - atr, "EXIT_SHORT_BREACH Alert", color=color.blue, textcolor=color.white, style=label.style_label_up)
+    signalSentThisBar := true
+
+// Ters İşlem Çıkışları
+if reverseToLong and reverseTradeOnBreach and not disableLongTrades and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.close(id="Short", comment="Ters İşlem - Long Açılıyor", alert_message=sellAlertMsgShort)
+    alert(sellAlertMsgShort, alert.freq_once_per_bar_close)
+    label.new(bar_index, low - atr, "EXIT_SHORT_REVERSE Alert", color=color.blue, textcolor=color.white, style=label.style_label_up)
+    if strategy.position_size == 0
+        strategy.entry(id="Long", direction=strategy.long, alert_message=buyAlertMsgLong)
+        alert(buyAlertMsgLong, alert.freq_once_per_bar_close)
+        label.new(bar_index, high + atr, "ENTER_LONG_REVERSE Alert", color=color.blue, textcolor=color.white, style=label.style_label_down)
+        lastTradeBar := bar_index
+        signalSentThisBar := true
+        lastSlWasShort := false
+
+if reverseToShort and reverseTradeOnBreach and not disableShortTrades and not signalSentThisBar and dateFilterApproval and barstate.isconfirmed
+    strategy.close(id="Long", comment="Ters İşlem - Short Açılıyor", alert_message=sellAlertMsgLong)
+    alert(sellAlertMsgLong, alert.freq_once_per_bar_close)
+    label.new(bar_index, high + atr, "EXIT_LONG_REVERSE Alert", color=color.blue, textcolor=color.white, style=label.style_label_down)
+    if strategy.position_size == 0
+        strategy.entry(id="Short", direction=strategy.short, alert_message=buyAlertMsgShort)
+        alert(buyAlertMsgShort, alert.freq_once_per_bar_close)
+        label.new(bar_index, low - atr, "ENTER_SHORT_REVERSE Alert", color=color.blue, textcolor=color.white, style=label.style_label_up)
+        lastTradeBar := bar_index
+        signalSentThisBar := true
+        lastSlWasLong := false
+
+// Sayaç ve Sıfırlama
+if barsSinceLastSl >= slLookbackPeriod
+    lastSlWasShort := false
+    lastSlWasLong := false
+
+if barstate.isconfirmed
+    barsSinceLastSl := barsSinceLastSl + 1
+    signalSentThisBar := false
+
+// Debug Etiketleri (Tampon Bölge ve İğne)
+if strategy.position_size > 0
+    label.new(bar_index, close, "Long Pozisyon Açık", color=color.green, textcolor=color.white, style=label.style_label_down)
+if strategy.position_size < 0
+    label.new(bar_index, close, "Short Pozisyon Açık", color=color.green, textcolor=color.white, style=label.style_label_up)
+if longBufferZoneEntered
+    label.new(bar_index, close, "Long Buffer Giriş\nSeviye: " + str.tostring(longBufferZoneLevel, "#.##"), color=color.yellow, textcolor=color.black, style=label.style_label_down)
+if shortBufferZoneEntered
+    label.new(bar_index, close, "Short Buffer Giriş\nSeviye: " + str.tostring(shortBufferZoneLevel, "#.##"), color=color.yellow, textcolor=color.black, style=label.style_label_up)
+if longBufferZoneReversal
+    label.new(bar_index, close, "Long Buffer Geri Dönüş", color=color.orange, textcolor=color.white, style=label.style_label_down)
+if shortBufferZoneReversal
+    label.new(bar_index, close, "Short Buffer Geri Dönüş", color=color.orange, textcolor=color.white, style=label.style_label_up)
+if longNeedleTouch
+    label.new(bar_index, high, "Long İğne Teması\nTP: " + str.tostring(lockedLongTpLevel, "#.##"), color=color.teal, textcolor=color.white, style=label.style_label_down)
+if shortNeedleTouch
+    label.new(bar_index, low, "Short İğne Teması\nTP: " + str.tostring(lockedShortTpLevel, "#.##"), color=color.teal, textcolor=color.white, style=label.style_label_up)
+if strategy.position_size > 0
+    label.new(bar_index, lockedLongTpLevel, "Long TP: " + str.tostring(lockedLongTpLevel, "#.##"), color=color.gray, textcolor=color.white, style=label.style_label_down)
+if strategy.position_size < 0
+    label.new(bar_index, lockedShortTpLevel, "Short TP: " + str.tostring(lockedShortTpLevel, "#.##"), color=color.gray, textcolor=color.white, style=label.style_label_up)
+
+// DENETLEYİCİ MANTIĞI
+if enableSupervisor and strategy.position_size != 0 and barstate.isconfirmed and not signalSentThisBar
+    // Bayrak sıfırlanması tespiti
+    bool flagResetDetected = false
+    string flagResetMessage = ""
+    if strategy.position_size > 0 and not longIsActive
+        flagResetDetected := true
+        flagResetMessage := "Long pozisyon açık, bayrak sıfırlanması tespit edildi!"
+    if strategy.position_size < 0 and not shortIsActive
+        flagResetDetected := true
+        flagResetMessage := "Short pozisyon açık, bayrak sıfırlanması tespit edildi!"
+    
+    // Bayrak sıfırlanması loglama
+    if flagResetDetected and supervisorLog
+        label.new(bar_index, high, "Denetleyici: Bayrak Sıfırlanması!", color=color.red, style=label.style_label_down, textcolor=color.white)
+        alert("Denetleyici devreye girdi: " + flagResetMessage + " Fiyat: " + str.tostring(close) + " Zaman: " + str.tostring(timenow))
+
+    // Çıkış koşulları kontrolü
+    bool exitTriggered = false
+    string exitReason = ""
+    string exitAlertMsg = ""
+
+    // Long pozisyon çıkış koşulları
+    if strategy.position_size > 0
+        // Normal TP
+        if close >= lockedLongTpLevel
+            exitTriggered := true
+            exitReason := "TP"
+            exitAlertMsg := sellTakeProfitAlertMsgLong
+        // Tampon bölge terki
+        else if enableBufferZone and close[1] >= longBufferZoneLevel and close < longBufferZoneLevel
+            exitTriggered := true
+            exitReason := "Tampon Bölge Terki"
+            exitAlertMsg := sellTakeProfitAlertMsgLong
+            //ön tampon***************
+        else if enableBufferZone and close[1] >= preLongBufferZoneLevel and close < preLongBufferZoneLevel and barstate.isconfirmed
+            exitTriggered := true
+            exitReason := "Ön Tampon Bölge Terki"
+            exitAlertMsg := sellTakeProfitAlertMsgLong
+            //ön tampon***************
+
+
+        // İğne teması
+        else if enableBufferZone and high >= lockedLongTpLevel and close < lockedLongTpLevel
+            exitTriggered := true
+            exitReason := "İğne Teması"
+            exitAlertMsg := sellTakeProfitAlertMsgLong
+        // SL
+        else if close <= longStopLossLevel and not disableStopLoss
+            exitTriggered := true
+            exitReason := "SL"
+            exitAlertMsg := sellAlertMsgLong
+        // Sahte SL
+        else if enableFakeStopLoss and fakeSlActive and close <= fakeLongStopLossLevel
+            exitTriggered := true
+            exitReason := "Sahte SL"
+            exitAlertMsg := sellAlertMsgLong
+        // Bant ihlali
+        else if significantShortBreach and not disableStopLoss
+            exitTriggered := true
+            exitReason := "Bant İhlali"
+            exitAlertMsg := sellAlertMsgLong
+        // Ters işlem
+        else if reverseToShort and reverseTradeOnBreach
+            exitTriggered := true
+            exitReason := "Ters İşlem"
+            exitAlertMsg := sellAlertMsgLong
+
+    // Short pozisyon çıkış koşulları
+    if strategy.position_size < 0
+        // Normal TP
+        if close <= lockedShortTpLevel
+            exitTriggered := true
+            exitReason := "TP"
+            exitAlertMsg := sellTakeProfitAlertMsgShort
+        // Tampon bölge terki
+        else if enableBufferZone and close[1] <= shortBufferZoneLevel and close > shortBufferZoneLevel
+            exitTriggered := true
+            exitReason := "Tampon Bölge Terki"
+            exitAlertMsg := sellTakeProfitAlertMsgShort
+            //ön tampon***************
+        else if enableBufferZone and close[1] <= preShortBufferZoneLevel and close > preShortBufferZoneLevel and barstate.isconfirmed
+            exitTriggered := true
+            exitReason := "Ön Tampon Bölge Terki"
+            exitAlertMsg := sellTakeProfitAlertMsgShort
+            //ön tampon***************
+
+        // İğne teması
+        else if enableBufferZone and low <= lockedShortTpLevel and close > lockedShortTpLevel
+            exitTriggered := true
+            exitReason := "İğne Teması"
+            exitAlertMsg := sellTakeProfitAlertMsgShort
+        // SL
+        else if close >= shortStopLossLevel and not disableStopLoss
+            exitTriggered := true
+            exitReason := "SL"
+            exitAlertMsg := sellAlertMsgShort
+        // Sahte SL
+        else if enableFakeStopLoss and fakeSlActive and close >= fakeShortStopLossLevel
+            exitTriggered := true
+            exitReason := "Sahte SL"
+            exitAlertMsg := sellAlertMsgShort
+        // Bant ihlali
+        else if significantLongBreach and not disableStopLoss
+            exitTriggered := true
+            exitReason := "Bant İhlali"
+            exitAlertMsg := sellAlertMsgShort
+        // Ters işlem
+        else if reverseToLong and reverseTradeOnBreach
+            exitTriggered := true
+            exitReason := "Ters İşlem"
+            exitAlertMsg := sellAlertMsgShort
+
+    // Çıkış işlemi
+    if exitTriggered
+        if strategy.position_size > 0
+            strategy.close(id=strategy.position_size > 0 ? "ManualLong" : "Long", comment="Denetleyici: " + exitReason, alert_message=exitAlertMsg)
+            signalSentThisBar := true
+            if supervisorLog
+                label.new(bar_index, high, "Denetleyici: Long Çıkış - " + exitReason, color=color.orange, style=label.style_label_down, textcolor=color.white)
+                alert("Denetleyici devreye girdi: Long çıkış - " + exitReason + " Fiyat: " + str.tostring(close) + " Seviye: " + (exitReason == "TP" ? str.tostring(lockedLongTpLevel) : exitReason == "SL" ? str.tostring(longStopLossLevel) : exitReason == "Ön Tampon Bölge Terki" ? str.tostring(preLongBufferZoneLevel) : "-"))
+                //alert("Denetleyici devreye girdi: Long çıkış - " + exitReason + " Fiyat: " + str.tostring(close) + " Seviye: " + (exitReason == "TP" ? str.tostring(lockedLongTpLevel) : exitReason == "SL" ? str.tostring(longStopLossLevel) : "-"))
+        else if strategy.position_size < 0
+            strategy.close(id=strategy.position_size < 0 ? "ManualShort" : "Short", comment="Denetleyici: " + exitReason, alert_message=exitAlertMsg)
+            signalSentThisBar := true
+            if supervisorLog
+                label.new(bar_index, low, "Denetleyici: Short Çıkış - " + exitReason, color=color.orange, style=label.style_label_up, textcolor=color.white)
+                alert("Denetleyici devreye girdi: Short çıkış - " + exitReason + " Fiyat: " + str.tostring(close) + " Seviye: " + (exitReason == "TP" ? str.tostring(lockedShortTpLevel) : exitReason == "SL" ? str.tostring(shortStopLossLevel) : exitReason == "Ön Tampon Bölge Terki" ? str.tostring(preShortBufferZoneLevel) : "-"))
+                //alert("Denetleyici devreye girdi: Short çıkış - " + exitReason + " Fiyat: " + str.tostring(close) + " Seviye: " + (exitReason == "TP" ? str.tostring(lockedShortTpLevel) : exitReason == "SL" ? str.tostring(shortStopLossLevel) : "-"))
+
+// STRATEGY EXECUTION sonu
+
+//*****STRATEGY EXECUTION sonu*************
+
+
+
+
+
+// PLOTTING
+plot(zlma, color=color.purple, title="ZLMA", linewidth=2)
+plot(sma, color=color.blue, title="SMA", linewidth=2)
+plot(upperBand, color=longIsActive ? color.green : shortIsActive ? color.red : color.gray, title="Üst Bant", style=plot.style_line)
+plot(lowerBand, color=longIsActive ? color.green : shortIsActive ? color.red : color.gray, title="Alt Bant", style=plot.style_line)
+plotshape(confirmedNewSignalUp ? zlma : na, title="Long Sinyal", style=shape.triangleup, location=location.absolute, color=color.green, size=size.tiny)
+plotshape(confirmedNewSignalDn ? zlma : na, title="Short Sinyal", style=shape.triangledown, location=location.absolute, color=color.red, size=size.tiny)
+
+var stopLossColor = color.new(color.maroon, 0)
+plotshape(longbaslangic ? longStopLossLevel : na, title="Stoploss Begins", location=location.absolute, style=shape.circle, size=size.tiny, color=stopLossColor)
+plot(series = longIsActive ? longStopLossLevel : na, title="Long Stop Loss", color=stopLossColor, linewidth=1, style=plot.style_linebr, offset=1)
+
+plotshape(shortbaslangic ? shortStopLossLevel : na, title="Stoploss Begins", location=location.absolute, style=shape.circle, size=size.tiny, color=stopLossColor)
+plot(series = shortIsActive ? shortStopLossLevel : na, title="Short Stop Loss", color=stopLossColor, linewidth=1, style=plot.style_linebr, offset=1)
+
+
+var takeProfitColor = color.new(color.teal, 0)
+plot(series = longIsActive  ? longTakeProfitLevel : na, title="Long Take Profit", color=takeProfitColor, linewidth=1, style=plot.style_linebr, offset = 1)
+plot(series = shortIsActive ? shortTakeProfitLevel : na, title="Short Take Profit", color=takeProfitColor, linewidth=1, style=plot.style_linebr, offset = 1)
+
+// SAHTE STOP LOSS  PLOTTING bölümüne ekle
+// PLOTTING bölümüne ekle
+// PLOTTING bölümünde güncelle
+var fakeSlColor = color.new(color.orange, 50)
+plot(series = enableFakeStopLoss and fakeSlActive and longIsActive ? fakeLongStopLossLevel : na, title="Sahte Long Stop Loss", color=fakeSlColor, linewidth=1, style=plot.style_linebr, offset = 1)
+plot(series = enableFakeStopLoss and fakeSlActive and shortIsActive ? fakeShortStopLossLevel : na, title="Sahte Short Stop Loss", color=fakeSlColor, linewidth=1, style=plot.style_linebr, offset = 1)
+
+
+
+// === TP TAMPON GÖSTERİMİ ===
+// === PLOTTING BÖLÜMÜ ===
+var bufferZoneColor = #fae90380
+plot(series = enableBufferZone and longIsActive ? longBufferZoneLevel : na, title="Long Tampon Bölge", color=bufferZoneColor, linewidth=1, style=plot.style_linebr, offset = 1)
+plot(series = enableBufferZone and shortIsActive ? shortBufferZoneLevel : na, title="Short Tampon Bölge", color=bufferZoneColor, linewidth=1, style=plot.style_linebr, offset = 1)
+
+// Mevcut tampon bölge çizimleri
+//var bufferZoneColor = #fae90380
+plot(series = enableBufferZone and longIsActive ? longBufferZoneLevel : na, title="Long Tampon Bölge", color=bufferZoneColor, linewidth=1, style=plot.style_linebr, offset=1)
+plot(series = enableBufferZone and shortIsActive ? shortBufferZoneLevel : na, title="Short Tampon Bölge", color=bufferZoneColor, linewidth=1, style=plot.style_linebr, offset=1)
+
+// Yeni ön tampon bölge çizimleri   kalkan 
+plot(series = enableBufferZone and longIsActive ? preLongBufferZoneLevel : na, title="Long Ön Tampon Bölge", color=bufferZoneColor, linewidth=1, style=plot.style_linebr, offset=1)
+plot(series = enableBufferZone and shortIsActive ? preShortBufferZoneLevel : na, title="Short Ön Tampon Bölge", color=bufferZoneColor, linewidth=1, style=plot.style_linebr, offset=1)
+// Yeni ön tampon bölge çizimleri   kalkan 
+
+
+
+
+// PLOTTING
+//plot(zlma, color=color.purple, title="ZLMA", linewidth=2)
+//plot(sma, color=color.blue, title="SMA", linewidth=2)
+//plot(upperBand, color=longIsActive ? color.green : shortIsActive ? color.red : color.gray, title="Üst Bant", style=plot.style_line)
+//plot(lowerBand, color=longIsActive ? color.green : shortIsActive ? color.red : color.gray, title="Alt Bant", style=plot.style_line)
+//plotshape(confirmedNewSignalUp ? zlma : na, title="Long Sinyal", style=shape.triangleup, location=location.absolute, color=color.green, size=size.tiny)
+//plotshape(confirmedNewSignalDn ? zlma : na, title="Short Sinyal", style=shape.triangledown, location=location.absolute, color=color.red, size=size.tiny)
+// [Mevcut diğer plot kodları]
+plotshape(newSignalUp and not confirmedNewSignalUp ? high : na, title="Potansiyel Long Sinyal", style=shape.triangleup, location=location.absolute, color=color.green, size=size.tiny)
+plotshape(newSignalDn and not confirmedNewSignalDn ? low : na, title="Potansiyel Short Sinyal", style=shape.triangledown, location=location.absolute, color=color.red, size=size.tiny)
+
